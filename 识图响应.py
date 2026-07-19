@@ -108,6 +108,101 @@ class WindowPicker:
             pass
         self.restore()
 
+class ExclusionSelector:
+    def __init__(self, parent, callback):
+        self.parent = parent
+        self.callback = callback
+        self.start_x = None
+        self.start_y = None
+        self.dragging = False
+        self.done = False
+
+        self.parent.iconify()
+        self.parent.update()
+
+        sw = parent.winfo_screenwidth()
+        sh = parent.winfo_screenheight()
+
+        self.win = tk.Toplevel(parent)
+        self.win.overrideredirect(True)
+        self.win.attributes('-topmost', True)
+        self.win.attributes('-alpha', 0.3)
+        self.win.geometry(f"{sw}x{sh}+0+0")
+        self.win.configure(bg='black')
+
+        self.canvas = tk.Canvas(self.win, highlightthickness=0, cursor='crosshair', bg='black')
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas.create_text(
+            sw // 2, 30,
+            text="按住鼠标左键拖拽选择排除区域，松开完成选择 | 按 ESC 取消",
+            fill='white', font=('Microsoft YaHei', 13)
+        )
+
+        self.win.bind('<Escape>', self.on_escape)
+        self.win.lift()
+        self.win.focus_force()
+        self.win.update()
+        self.canvas.update()
+
+        self.parent.after(100, self.poll_mouse)
+
+    def poll_mouse(self):
+        if self.done:
+            return
+        state = ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000
+        pt = ctypes.wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+
+        if state:
+            if not self.dragging:
+                self.dragging = True
+                self.start_x = pt.x
+                self.start_y = pt.y
+                self.canvas.delete('rect')
+                self.rect_id = self.canvas.create_rectangle(
+                    self.start_x, self.start_y, pt.x, pt.y,
+                    outline='#00ff00', width=3, fill='#00ff00', stipple='gray50', tags='rect'
+                )
+            else:
+                if self.rect_id:
+                    self.canvas.coords(self.rect_id, self.start_x, self.start_y, pt.x, pt.y)
+            self.parent.after(30, self.poll_mouse)
+        else:
+            if self.dragging:
+                self.dragging = False
+                self.done = True
+                x1, y1 = min(self.start_x, pt.x), min(self.start_y, pt.y)
+                x2, y2 = max(self.start_x, pt.x), max(self.start_y, pt.y)
+                try:
+                    self.win.destroy()
+                except:
+                    pass
+                if x2 - x1 < 10 or y2 - y1 < 10:
+                    self.parent.after(0, self.restore)
+                    return
+                self.parent.after(0, lambda: self.do_select(x1, y1, x2, y2))
+            else:
+                self.parent.after(50, self.poll_mouse)
+
+    def do_select(self, x1, y1, x2, y2):
+        self.callback(x1, y1, x2, y2)
+        self.restore()
+
+    def restore(self):
+        self.parent.deiconify()
+        self.parent.lift()
+        self.parent.focus_force()
+
+    def on_escape(self, event):
+        self.done = True
+        try:
+            self.win.destroy()
+        except:
+            pass
+        self.restore()
+
+
 class RegionSelector:
     def __init__(self, parent, callback):
         self.parent = parent
@@ -215,7 +310,7 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("识图响应")
-        self.root.geometry("520x580")
+        self.root.geometry("520x640")
         self.root.resizable(False, False)
 
         self.monitoring = False
@@ -232,6 +327,7 @@ class App:
         self.selected_pid = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
         self.match_count = 0
+        self.exclude_regions = []
 
         self.setup_ui()
         self.load_config()
@@ -268,7 +364,15 @@ class App:
             relief=tk.SUNKEN, anchor=tk.CENTER,
             background='#f5f5f5', foreground='#999'
         )
-        self.preview_lbl.pack(fill=tk.X, pady=(0, 10), ipady=35)
+        self.preview_lbl.pack(fill=tk.X, pady=(0, 5), ipady=35)
+
+        ttk.Label(main, text="排除区域（可选）", font=('', 10, 'bold')).pack(anchor=tk.W)
+        ef = ttk.Frame(main)
+        ef.pack(fill=tk.X, pady=(3, 2))
+        ttk.Button(ef, text="框选排除", command=self.start_exclude_capture, width=12).pack(side=tk.LEFT)
+        ttk.Button(ef, text="清除排除", command=self.clear_exclude_regions, width=12).pack(side=tk.LEFT, padx=(5, 0))
+        self.exclude_status_lbl = ttk.Label(ef, text="未设置", foreground='#999')
+        self.exclude_status_lbl.pack(side=tk.RIGHT)
 
         ttk.Label(main, text="识别相似度", font=('', 10, 'bold')).pack(anchor=tk.W)
         sf = ttk.Frame(main)
@@ -349,6 +453,25 @@ class App:
             self.status_var.set(f"已加载图片: {os.path.basename(path)}")
         except Exception as e:
             messagebox.showerror("错误", f"加载图片失败: {e}")
+
+    def start_exclude_capture(self):
+        if self.monitoring:
+            self.stop_monitoring()
+        ExclusionSelector(self.root, self.on_exclude_region_selected)
+
+    def on_exclude_region_selected(self, x1, y1, x2, y2):
+        self.exclude_regions.append((x1, y1, x2, y2))
+        w, h = x2 - x1, y2 - y1
+        self.exclude_status_lbl.config(
+            text=f"{len(self.exclude_regions)} 个区域",
+            foreground='#c90'
+        )
+        self.status_var.set(f"已添加排除区域: ({x1},{y1})-({x2},{y2}) ({w}x{h})")
+
+    def clear_exclude_regions(self):
+        self.exclude_regions.clear()
+        self.exclude_status_lbl.config(text="未设置", foreground='#999')
+        self.status_var.set("已清除所有排除区域")
 
     def clear_template(self):
         self.template_image = None
@@ -439,6 +562,24 @@ class App:
                     time.sleep(0.3)
                     continue
 
+                if self.exclude_regions:
+                    mask = np.ones_like(screen_cv, dtype=np.uint8) * 255
+                    for (ex1, ey1, ex2, ey2) in self.exclude_regions:
+                        if bbox:
+                            rx1 = ex1 - bbox[0]
+                            ry1 = ey1 - bbox[1]
+                            rx2 = ex2 - bbox[0]
+                            ry2 = ey2 - bbox[1]
+                        else:
+                            rx1, ry1, rx2, ry2 = ex1, ey1, ex2, ey2
+                        rx1 = max(0, rx1)
+                        ry1 = max(0, ry1)
+                        rx2 = min(screen_cv.shape[1], rx2)
+                        ry2 = min(screen_cv.shape[0], ry2)
+                        if rx2 > rx1 and ry2 > ry1:
+                            cv2.rectangle(mask, (rx1, ry1), (rx2, ry2), 0, -1)
+                    screen_cv = cv2.bitwise_and(screen_cv, screen_cv, mask=mask)
+
                 result = cv2.matchTemplate(screen_cv, template, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, _ = cv2.minMaxLoc(result)
 
@@ -475,6 +616,11 @@ class App:
                 else:
                     self.bind_status_lbl.config(text="未绑定", foreground='#999')
 
+                loaded_exclude = cfg.get('exclude_regions', [])
+                if loaded_exclude:
+                    self.exclude_regions = [(int(x1), int(y1), int(x2), int(y2)) for (x1, y1, x2, y2) in loaded_exclude]
+                    self.exclude_status_lbl.config(text=f"{len(self.exclude_regions)} 个区域", foreground='#c90')
+
                 if os.path.exists(TEMPLATE_FILE):
                     self.template_image = Image.open(TEMPLATE_FILE)
                     arr = np.array(self.template_image.convert('RGB'))
@@ -490,7 +636,8 @@ class App:
                 'similarity': self.similarity.get(),
                 'play_sound': self.play_sound.get(),
                 'window': self.selected_window.get(),
-                'pid': self.selected_pid.get()
+                'pid': self.selected_pid.get(),
+                'exclude_regions': self.exclude_regions
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
